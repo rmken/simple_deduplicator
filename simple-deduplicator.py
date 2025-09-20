@@ -623,6 +623,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.missing_found_counter = 0
         self.missing_source: List[Path] = []
         self.missing_destinations: List[Path] = []
+        self._cleanup_status_message = "Ready"
         
         # Performance tracking
         self.last_update_time = 0
@@ -662,8 +663,11 @@ class SimpleDeduplicatorApp(QMainWindow):
 
         # Shared widgets
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
+        self.progress_bar.setVisible(True)
         self.progress_bar.setTextVisible(True)  # Show percentage
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0%")
         
         self.results_table = QTableWidget()
         self.configure_results_table()
@@ -1498,12 +1502,14 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.missing_stop_btn.setEnabled(scanning)
         
         if scanning:
-            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("0% (0/0)")
             self.statusBar().showMessage("Scanning...")
         else:
-            self.progress_bar.setVisible(False)
-            self.statusBar().showMessage("Ready")
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("0%")
+            self.statusBar().showMessage(self._cleanup_status_message or "Ready")
 
     def pause_scan(self):
         """Pause or resume the scanning process with synchronized button text."""
@@ -1531,7 +1537,9 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.worker_thread.quit()
             self.worker_thread.wait(5000)  # Wait up to 5 seconds
             self.system_messages.add_message("Scan stopped by user")
-            self.statusBar().showMessage("Scan stopped")
+            self._cleanup_status_message = "Scan stopped"
+            self.statusBar().showMessage(self._cleanup_status_message)
+            self._request_scan_cleanup()
     
     def update_progress(self, progress: ScanProgress):
         """Update progress with throttling for better performance."""
@@ -1603,10 +1611,12 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.system_messages.add_message(
                 f"Potential space savings: {self.format_size(total_size)}"
             )
+            self._cleanup_status_message = "Duplicate scan completed"
         else:
             # Missing scan completed
             self.system_messages.add_message(f"Missing file comparison completed in {duration:.1f}s")
             self.system_messages.add_message(f"Found {self.missing_found_counter:,} missing files")
+            self._cleanup_status_message = "Missing comparison completed"
 
         self.update_selection_info()
         
@@ -1680,8 +1690,11 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.hash_worker.is_paused = False
             self.hash_worker.is_cancelled = False
 
-        status_msg = "Missing comparison completed" if self.current_mode == "missing" else "Duplicate scan completed"
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0%")
+        status_msg = getattr(self, '_cleanup_status_message', "Ready")
         self.statusBar().showMessage(status_msg)
+        self._cleanup_status_message = "Ready"
 
         self._cleanup_requested = False
         self._cleanup_in_progress = False
@@ -1853,9 +1866,11 @@ Status: {file_info.status}"""
         msg.setIcon(QMessageBox.Icon.Question)
         msg.setWindowTitle("Confirm Bulk Delete")
         msg.setText(f"Move {len(files_to_delete)} files to trash?")
-        msg.setDetailedText(f"Total size: {self.format_size(total_size)}\n\n" + 
-                           "\n".join(f"• {info.path.name}" for _, info in files_to_delete[:10]) +
-                           (f"\n... and {len(files_to_delete) - 10} more" if len(files_to_delete) > 10 else ""))
+        preview_lines = "\n".join(f"• {info.path}" for _, info in files_to_delete[:10])
+        if len(files_to_delete) > 10:
+            preview_lines += f"\n... and {len(files_to_delete) - 10} more"
+        msg.setInformativeText("Files will be moved to the system trash.")
+        msg.setDetailedText(f"Total size: {self.format_size(total_size)}\n\n{preview_lines}")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg.setDefaultButton(QMessageBox.StandardButton.No)
         
@@ -1863,7 +1878,6 @@ Status: {file_info.status}"""
             return
         
         # Delete files with progress
-        self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(len(files_to_delete))
         self.progress_bar.setValue(0)
         
@@ -1880,6 +1894,7 @@ Status: {file_info.status}"""
                 self._remove_file_from_data(file_info)
                 self._cleanup_empty_hash(file_info.hash_value)
                 deleted_count += 1
+                self.system_messages.add_message(f"Moved to trash: {file_info.path}")
             except Exception as e:
                 self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
                 failed_count += 1
@@ -1887,8 +1902,10 @@ Status: {file_info.status}"""
             self.progress_bar.setValue(i + 1)
             QApplication.processEvents()  # Keep UI responsive
         
-        self.progress_bar.setVisible(False)
-        
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0%")
+        self.progress_bar.setMaximum(100)
+
         # Report results
         if failed_count == 0:
             self.system_messages.add_message(f"Successfully deleted {deleted_count} files")
