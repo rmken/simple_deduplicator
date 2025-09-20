@@ -1730,7 +1730,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         # Add delete button
         delete_btn = QPushButton("Delete")
         delete_btn.setMaximumHeight(24)
-        delete_btn.clicked.connect(lambda checked=False, r=row: self.delete_single_file(r))
+        delete_btn.clicked.connect(lambda checked=False, btn=delete_btn: self.delete_single_file_by_button(btn))
         self.results_table.setCellWidget(row, 5, delete_btn)
 
     def show_results_context_menu(self, position):
@@ -1814,31 +1814,56 @@ Status: {file_info.status}"""
             return None
         return item.data(Qt.ItemDataRole.UserRole)
 
+    def delete_single_file_by_button(self, button: QPushButton):
+        """Resolve row from delete button and remove the file."""
+        cell_widget = button.parentWidget()
+        if not cell_widget:
+            return
+        index = self.results_table.indexAt(cell_widget.pos())
+        if not index.isValid():
+            return
+        self.delete_single_file(index.row())
+
     def delete_single_file(self, row: int):
         """Delete a single file with improved error handling."""
         file_info = self._get_file_info_from_row(row)
         if not file_info:
             return
-        
+
         # Confirm deletion
-        reply = QMessageBox.question(
-            self, "Confirm Delete",
-            f"Move to trash:\n{file_info.path}\n\nSize: {self.format_size(file_info.size)}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
+        if file_info.path.exists():
+            message = f"Move to trash:\n{file_info.path}\n\nSize: {self.format_size(file_info.size)}"
+            reply = QMessageBox.question(
+                self, "Confirm Delete",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            reply = QMessageBox.question(
+                self, "File Missing",
+                f"This file no longer exists on disk:\n{file_info.path}\n\nRemove it from the list?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            if file_info.path.exists():
                 self.move_to_trash(file_info.path)
-                self.results_table.removeRow(row)
-                self._remove_file_from_data(file_info)
-                self._cleanup_empty_hash(file_info.hash_value)
-                self.system_messages.add_message(f"Moved to trash: {file_info.path.name}")
-                self.update_selection_info()
-            except Exception as e:
-                self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
-                QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
+                self.system_messages.add_message(f"Moved to trash: {file_info.path}")
+            else:
+                self.system_messages.add_warning(f"File already missing: {file_info.path}")
+            self.results_table.removeRow(row)
+            self._remove_file_from_data(file_info)
+            self._cleanup_empty_hash(file_info.hash_value)
+            self.update_selection_info()
+        except Exception as e:
+            self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
+            QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
     
     def delete_selected_files(self):
         """Delete all selected files with improved confirmation and progress."""
