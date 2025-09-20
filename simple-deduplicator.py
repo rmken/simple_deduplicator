@@ -1833,6 +1833,10 @@ Status: {file_info.status}"""
         if not file_info:
             return
 
+        if self.current_mode == "duplicates":
+            self._remove_duplicate_entry(row, file_info)
+            return
+
         # Confirm deletion
         if file_info.path.exists():
             message = f"Move to trash:\n{file_info.path}\n\nSize: {self.format_size(file_info.size)}"
@@ -1867,6 +1871,22 @@ Status: {file_info.status}"""
         except Exception as e:
             self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
             QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
+
+    def _remove_duplicate_entry(self, row: int, file_info: FileInfo):
+        """Remove a duplicate entry from the results without touching the file system."""
+        self.results_table.removeRow(row)
+
+        hash_value = file_info.hash_value
+        files = self.file_data.get(hash_value, [])
+        remaining = [info for info in files if info.path != file_info.path]
+        if remaining:
+            self.file_data[hash_value] = remaining
+        else:
+            self.file_data.pop(hash_value, None)
+
+        self._cleanup_empty_hash(hash_value)
+        self.system_messages.add_message(f"Removed from results: {file_info.path}")
+        self.update_selection_info()
     
     def delete_selected_files(self):
         """Delete all selected files with improved confirmation and progress."""
