@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+*.pkg
+*.toc
+*.pyz
+*.bin
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE configs
+.vscode/
+.idea/
+
+# Misc
+*.tmp
+*.bak

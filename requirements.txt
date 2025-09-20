@@ -1,0 +1,4 @@
+# Runtime dependencies for Simple Deduplicator
+PySide6>=6.5.0
+xxhash>=3.0.0
+blake3>=0.3.0
