@@ -1248,6 +1248,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.results_table.setSortingEnabled(True)
         self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
+        self.results_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.results_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         
         # Set default column widths
         header = self.results_table.horizontalHeader()
