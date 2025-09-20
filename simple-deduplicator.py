@@ -42,9 +42,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QTextEdit, QSplitter, QFileDialog, QMessageBox,
-    QComboBox, QLabel, QCheckBox, QSpinBox, QGroupBox, QFrame,
+    QComboBox, QLabel, QSpinBox, QFrame,
     QAbstractItemView, QStyle, QListView, QTreeView, QSizePolicy,
-    QMenu, QLayout
+    QMenu, QLayout, QTabWidget
 )
 from PySide6.QtCore import (
     QThread, QObject, Signal, QTimer, Qt, QSize, QSettings, QUrl
@@ -457,46 +457,58 @@ class SimpleDeduplicatorApp(QMainWindow):
         # Create splitter for resizable panels
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
-        
-        # Left panel (main controls and table)
-        left_panel = self.create_left_panel()
-        splitter.addWidget(left_panel)
-        
+
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        splitter.addWidget(left_container)
+
+        tabs = QTabWidget()
+        self.tabs = tabs
+        tabs.currentChanged.connect(self.on_tab_changed)
+        left_layout.addWidget(tabs)
+
+        duplicates_tab = QWidget()
+        duplicates_layout = QVBoxLayout(duplicates_tab)
+        duplicates_controls = self.create_duplicates_controls()
+        duplicates_layout.addWidget(duplicates_controls)
+        tabs.addTab(duplicates_tab, "Duplicates")
+
+        missing_tab = QWidget()
+        missing_layout = QVBoxLayout(missing_tab)
+        missing_controls = self.create_missing_panel_controls()
+        missing_layout.addWidget(missing_controls)
+        tabs.addTab(missing_tab, "Missing")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        left_layout.addWidget(self.progress_bar)
+
+        self.results_table = QTableWidget()
+        self.configure_results_table()
+        left_layout.addWidget(self.results_table)
+
+        self.bottom_controls = self.create_bottom_controls()
+        left_layout.addWidget(self.bottom_controls)
+
         # Right panel (system messages)
         self.system_messages = SystemMessagesWidget()
         splitter.addWidget(self.system_messages)
-        
-        # Set splitter proportions (80% left, 20% right)
-        splitter.setSizes([800, 200])
+
+        splitter.setSizes([900, 300])
         
         self._tune_layout_spacing()
 
         # Status bar
         self.statusBar().showMessage("Ready")
 
-    def create_left_panel(self) -> QWidget:
-        """Create the left panel with controls and table."""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        
-        # Controls section
+    def create_duplicates_controls(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
         controls_frame = self.create_controls_section()
         layout.addWidget(controls_frame)
-        
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-        
-        # Results table
-        self.create_results_table()
-        layout.addWidget(self.results_table)
-        
-        # Bottom controls
-        bottom_controls = self.create_bottom_controls()
-        layout.addWidget(bottom_controls)
-        
-        return panel
+
+        return widget
 
     def _tune_layout_spacing(self):
         """Ensure layouts have comfortable spacing in both themes."""
@@ -756,11 +768,6 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_results)
         scan_layout.addWidget(self.clear_btn)
 
-        self.missing_scan_btn = QPushButton("Find Missing")
-        self.missing_scan_btn.setToolTip("Compare folders and list files missing from backups")
-        self.missing_scan_btn.clicked.connect(self.start_missing_scan)
-        scan_layout.addWidget(self.missing_scan_btn)
-
         self.save_btn = QPushButton("Save Results")
         self.save_btn.clicked.connect(self.save_results)
         scan_layout.addWidget(self.save_btn)
@@ -771,12 +778,94 @@ class SimpleDeduplicatorApp(QMainWindow):
         
         scan_layout.addStretch()
         layout.addLayout(scan_layout)
-        
+
         return frame
+
+    def create_missing_panel_controls(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        info_label = QLabel(
+            "Select source folders (originals) and destination folders (backups).\n"
+            "Files present in source but missing in any destination will appear below."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        source_layout = QHBoxLayout()
+        self.missing_source_btn = QPushButton("Select Source")
+        self.missing_source_btn.clicked.connect(self.select_missing_source)
+        source_layout.addWidget(self.missing_source_btn)
+        self.missing_source_label = QLabel("No source folders selected")
+        source_layout.addWidget(self.missing_source_label)
+        source_layout.addStretch()
+        layout.addLayout(source_layout)
+
+        dest_layout = QHBoxLayout()
+        self.missing_dest_btn = QPushButton("Select Destinations")
+        self.missing_dest_btn.clicked.connect(self.select_missing_destinations)
+        dest_layout.addWidget(self.missing_dest_btn)
+        self.missing_dest_label = QLabel("No destination folders selected")
+        dest_layout.addWidget(self.missing_dest_label)
+        dest_layout.addStretch()
+        layout.addLayout(dest_layout)
+
+        button_layout = QHBoxLayout()
+        self.missing_scan_btn = QPushButton("Find Missing")
+        self.missing_scan_btn.setToolTip("Compare source folders against destinations")
+        self.missing_scan_btn.clicked.connect(self.start_missing_scan)
+        button_layout.addWidget(self.missing_scan_btn)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        layout.addStretch()
+
+        return panel
+
+    def select_missing_source(self):
+        dialog = QFileDialog(self, "Select Source Folders")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontResolveSymlinks, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+
+        for view_class in (QListView, QTreeView):
+            for view in dialog.findChildren(view_class):
+                view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+        if dialog.exec():
+            folders = [Path(path) for path in dialog.selectedFiles() if Path(path).is_dir()]
+            if folders:
+                self.missing_source = folders
+                display_text = str(folders[0])
+                if len(folders) > 1:
+                    display_text = f"{display_text} (+{len(folders) - 1} more)"
+                self.missing_source_label.setText(display_text)
+                self.missing_source_label.setToolTip("\n".join(str(folder) for folder in folders))
+
+    def select_missing_destinations(self):
+        dialog = QFileDialog(self, "Select Destination Folders")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontResolveSymlinks, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+
+        for view_class in (QListView, QTreeView):
+            for view in dialog.findChildren(view_class):
+                view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+        if dialog.exec():
+            folders = [Path(path) for path in dialog.selectedFiles() if Path(path).is_dir()]
+            if folders:
+                self.missing_destinations = folders
+                display_text = str(folders[0])
+                if len(folders) > 1:
+                    display_text = f"{display_text} (+{len(folders) - 1} more)"
+                self.missing_dest_label.setText(display_text)
+                self.missing_dest_label.setToolTip("\n".join(str(folder) for folder in folders))
     
-    def create_results_table(self):
-        """Create the results table."""
-        self.results_table = QTableWidget()
+    def configure_results_table(self):
+        self.results_table.setParent(None)
         self.results_table.setColumnCount(6)
         self.results_table.setHorizontalHeaderLabels([
             "Filename", "Path", "Size", "Hash", "Status", "Action"
@@ -806,6 +895,12 @@ class SimpleDeduplicatorApp(QMainWindow):
     def on_sort(self, logical_index: int):
         _ = logical_index
         self.update_selection_info()
+
+    def on_tab_changed(self, index: int):
+        if index == 0:
+            self.current_mode = "duplicates"
+        else:
+            self.current_mode = "missing"
 
     def create_bottom_controls(self) -> QWidget:
         """Create bottom control buttons."""
@@ -842,7 +937,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.hash_worker.error_occurred.connect(self.handle_error)
         self.hash_worker.duplicates_updated.connect(self.update_duplicates_view)
         self.hash_worker.missing_found.connect(self.handle_missing_found)
-        
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
         # Table selection changes
         self.results_table.itemSelectionChanged.connect(self.update_selection_info)
     
@@ -894,11 +990,13 @@ class SimpleDeduplicatorApp(QMainWindow):
     
     def start_scan(self):
         """Start the file scanning process."""
+        if self.current_mode != "duplicates":
+            self.tabs.setCurrentIndex(0)
         if not hasattr(self, 'selected_folders') or not self.selected_folders:
             self.system_messages.add_message("ERROR: No folders selected for scanning")
             QMessageBox.warning(self, "Warning", "Please select folders to scan first.")
             return
-        
+
         # Prepare worker
         algorithm = self.algorithm_combo.currentText().lower()
         chunk_size = self.chunk_size_spin.value() * 1024  # Convert KB to bytes
@@ -932,14 +1030,20 @@ class SimpleDeduplicatorApp(QMainWindow):
 
     def start_missing_scan(self):
         """Compare folders and list files missing from backups."""
-        if not hasattr(self, 'selected_folders') or not self.selected_folders:
-            self.system_messages.add_message("ERROR: No folders selected for scanning")
-            QMessageBox.warning(self, "Warning", "Please select folders to scan first.")
+        if self.current_mode != "missing":
+            self.tabs.setCurrentIndex(1)
+        if not hasattr(self, 'missing_source') or not self.missing_source:
+            QMessageBox.warning(self, "Missing Source", "Select one or more source folders.")
+            return
+        if not hasattr(self, 'missing_destinations') or not self.missing_destinations:
+            QMessageBox.warning(self, "Missing Destination", "Select one or more destination folders.")
             return
 
-        if len(self.selected_folders) < 2:
-            self.system_messages.add_message("ERROR: Missing comparison needs at least two folders")
-            QMessageBox.warning(self, "Warning", "Select at least two folders (source + backup).")
+        self.selected_folders = [self.missing_source[0]] + list(self.missing_destinations)
+
+        if not self.selected_folders:
+            self.system_messages.add_message("ERROR: No folders selected for scanning")
+            QMessageBox.warning(self, "Warning", "Please select folders to scan first.")
             return
 
         # Prepare worker
