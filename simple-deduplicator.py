@@ -101,6 +101,7 @@ class HashWorker(QObject):
     file_processed = Signal(FileInfo)
     scan_completed = Signal(dict)  # {hash: [FileInfo]}
     error_occurred = Signal(str)
+    duplicates_updated = Signal(list)  # List[FileInfo]
     
     def __init__(self):
         super().__init__()
@@ -261,6 +262,11 @@ class HashWorker(QObject):
                         
                         progress.bytes_processed += file_size
                         self.file_processed.emit(file_info)
+
+                        if len(hash_groups[hash_value]) >= 2:
+                            for info in hash_groups[hash_value]:
+                                info.is_duplicate = True
+                            self.duplicates_updated.emit(hash_groups[hash_value][:])
                     
                 except Exception as e:
                     progress.errors_count += 1
@@ -457,6 +463,66 @@ class SimpleDeduplicatorApp(QMainWindow):
         else:
             self.file_data.pop(file_info.hash_value, None)
 
+    def _row_for_path(self, path: Path) -> Optional[int]:
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, 0)
+            if not item:
+                continue
+            file_info: Optional[FileInfo] = item.data(Qt.ItemDataRole.UserRole)
+            if file_info and file_info.path == path:
+                return row
+        return None
+
+    def _refresh_row(self, row: int, file_info: FileInfo):
+        filename_item = self.results_table.item(row, 0)
+        path_item = self.results_table.item(row, 1)
+        size_item = self.results_table.item(row, 2)
+        hash_item = self.results_table.item(row, 3)
+        status_item = self.results_table.item(row, 4)
+
+        if filename_item:
+            filename_item.setText(file_info.path.name)
+            filename_item.setToolTip(str(file_info.path))
+            filename_item.setData(Qt.ItemDataRole.UserRole, file_info)
+
+        if path_item:
+            path_item.setText(str(file_info.path.parent))
+            path_item.setToolTip(str(file_info.path))
+
+        if size_item:
+            size_item.setText(self.format_size(file_info.size))
+            size_item.setData(Qt.ItemDataRole.UserRole, file_info.size)
+
+        if hash_item:
+            hash_item.setText(file_info.hash_value[:16] + "...")
+            hash_item.setToolTip(file_info.hash_value)
+
+        if status_item:
+            status_item.setText("Duplicate")
+            status_item.setBackground(QColor(255, 200, 200))
+
+    def update_duplicates_view(self, files: List[FileInfo]):
+        if not files:
+            return
+
+        hash_value = files[0].hash_value
+
+        existing_files = [info for info in files if info.path.exists()]
+        if not existing_files:
+            self.file_data.pop(hash_value, None)
+            return
+
+        self.file_data[hash_value] = existing_files
+
+        for file_info in existing_files:
+            row = self._row_for_path(file_info.path)
+            if row is None:
+                self.add_file_to_table(file_info)
+            else:
+                self._refresh_row(row, file_info)
+
+        self.update_selection_info()
+
     def create_controls_section(self) -> QFrame:
         """Create the main controls section."""
         frame = QFrame()
@@ -589,6 +655,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.hash_worker.file_processed.connect(self.file_processed)
         self.hash_worker.scan_completed.connect(self.scan_completed)
         self.hash_worker.error_occurred.connect(self.handle_error)
+        self.hash_worker.duplicates_updated.connect(self.update_duplicates_view)
         
         # Table selection changes
         self.results_table.itemSelectionChanged.connect(self.update_selection_info)
@@ -666,7 +733,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        
+        self.statusBar().showMessage("Preparing scan...")
+
         self.scan_start_time = time.time()
         self.system_messages.add_message(
             f"Scan started using {algorithm.upper()} hashing"
@@ -693,13 +761,18 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.worker_thread.quit()
             self.worker_thread.wait()
             self.system_messages.add_message("Scan aborted by user")
+            self.statusBar().showMessage("Scan aborted")
+            self.progress_bar.setVisible(False)
     
     def update_progress(self, progress: ScanProgress):
         """Update the progress bar and status."""
         if progress.total_files > 0:
             percentage = int((progress.files_scanned / progress.total_files) * 100)
-            self.progress_bar.setValue(percentage)
-        
+        else:
+            percentage = 0
+
+        self.progress_bar.setValue(percentage)
+
         status = f"Scanning: {progress.files_scanned}/{progress.total_files} files"
         if progress.current_file:
             status += f" - {Path(progress.current_file).name}"
@@ -909,7 +982,7 @@ class SimpleDeduplicatorApp(QMainWindow):
                 f"Bulk delete completed: {deleted_count} deleted, {failed_count} failed"
             )
             self.update_selection_info()
-    
+
     def move_to_trash(self, file_path: Path):
         """Move file to trash/recycle bin."""
         try:
