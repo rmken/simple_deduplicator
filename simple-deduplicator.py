@@ -14,7 +14,7 @@ import locale
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 import json
@@ -80,6 +80,8 @@ class FileInfo:
     hash_value: str
     is_duplicate: bool = False
     error: Optional[str] = None
+    status: str = "Unknown"
+    missing_locations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +104,7 @@ class HashWorker(QObject):
     scan_completed = Signal(dict)  # {hash: [FileInfo]}
     error_occurred = Signal(str)
     duplicates_updated = Signal(list)  # List[FileInfo]
+    missing_found = Signal(FileInfo)
     
     def __init__(self):
         super().__init__()
@@ -111,12 +114,14 @@ class HashWorker(QObject):
         self.is_paused = False
         self.is_cancelled = False
         self.executor: Optional[ThreadPoolExecutor] = None
+        self.mode = "duplicates"
         
-    def set_parameters(self, folders: List[Path], algorithm: str, chunk_size: int):
+    def set_parameters(self, folders: List[Path], algorithm: str, chunk_size: int, mode: str = "duplicates"):
         """Set scanning parameters."""
         self.folders = folders
         self.hash_algorithm = algorithm.lower()
         self.chunk_size = chunk_size
+        self.mode = mode
         
     def pause(self):
         """Pause the scanning process."""
@@ -189,7 +194,11 @@ class HashWorker(QObject):
         """Main scanning method."""
         logger.info("Starting file scan")
         start_time = time.time()
-        
+
+        if self.mode == "missing":
+            self.run_missing_scan()
+            return
+
         # Collect all files
         all_files = self._collect_files()
         if not all_files:
@@ -253,7 +262,8 @@ class HashWorker(QObject):
                         file_info = FileInfo(
                             path=file_path,
                             size=file_size,
-                            hash_value=hash_value
+                            hash_value=hash_value,
+                            status="Unique"
                         )
                         
                         if hash_value not in hash_groups:
@@ -280,6 +290,7 @@ class HashWorker(QObject):
             if len(files) > 1:
                 for file_info in files:
                     file_info.is_duplicate = True
+                    file_info.status = "Duplicate"
                     duplicates_count += 1
         
         progress.duplicates_found = duplicates_count
@@ -292,6 +303,83 @@ class HashWorker(QObject):
         logger.info(f"Found {duplicates_count} duplicate files")
         
         self.scan_completed.emit(hash_groups)
+
+    def run_missing_scan(self):
+        """Identify files missing from backup folders by name and size."""
+        if len(self.folders) < 2:
+            self.error_occurred.emit("Select at least two folders to compare for missing files")
+            return
+
+        primary = self.folders[0]
+        backups = self.folders[1:]
+
+        try:
+            primary_files = [
+                file_path
+                for file_path in primary.rglob("*")
+                if file_path.is_file() and not file_path.is_symlink()
+            ]
+        except (OSError, PermissionError) as exc:
+            self.error_occurred.emit(f"Cannot access folder {primary}: {exc}")
+            return
+
+        progress = ScanProgress(total_files=len(primary_files))
+        self.progress_updated.emit(progress)
+
+        backup_indexes: List[Tuple[Path, set]] = []
+        for folder in backups:
+            key_set = set()
+            try:
+                for file_path in folder.rglob("*"):
+                    if file_path.is_file() and not file_path.is_symlink():
+                        try:
+                            size = file_path.stat().st_size
+                        except (OSError, PermissionError):
+                            continue
+                        key = (file_path.name.lower(), size)
+                        key_set.add(key)
+            except (OSError, PermissionError) as exc:
+                self.error_occurred.emit(f"Cannot access folder {folder}: {exc}")
+            backup_indexes.append((folder, key_set))
+
+        for file_path in primary_files:
+            if self.is_cancelled:
+                break
+
+            while self.is_paused and not self.is_cancelled:
+                time.sleep(0.1)
+
+            try:
+                size = file_path.stat().st_size
+            except (OSError, PermissionError):
+                continue
+
+            progress.files_scanned += 1
+            progress.current_file = str(file_path)
+            self.progress_updated.emit(progress)
+
+            key = (file_path.name.lower(), size)
+            missing_locations = [
+                str(folder)
+                for folder, key_set in backup_indexes
+                if key not in key_set
+            ]
+
+            if missing_locations:
+                info = FileInfo(
+                    path=file_path,
+                    size=size,
+                    hash_value=f"missing::{file_path.resolve()}",
+                    status="Missing",
+                    missing_locations=missing_locations,
+                )
+                self.missing_found.emit(info)
+
+        progress.files_scanned = progress.total_files
+        progress.current_file = ""
+        self.progress_updated.emit(progress)
+
+        self.scan_completed.emit({})
 
 
 class SystemMessagesWidget(QWidget):
@@ -348,6 +436,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.worker_thread: Optional[QThread] = None
         self.file_data: Dict[str, List[FileInfo]] = {}
         self.scan_start_time: Optional[float] = None
+        self.current_mode = "duplicates"
+        self.missing_found_counter = 0
         
         self.init_ui()
         self.setup_connections()
@@ -462,6 +552,48 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.file_data[file_info.hash_value] = updated
         else:
             self.file_data.pop(file_info.hash_value, None)
+        self._cleanup_empty_hash(file_info.hash_value)
+
+    def _cleanup_empty_hash(self, hash_value: str):
+        files = self.file_data.get(hash_value)
+        if not files:
+            self.file_data.pop(hash_value, None)
+            return
+
+        if self.current_mode != "duplicates":
+            return
+
+        if len(files) <= 1:
+            survivor = files[0]
+            row = self._row_for_path(survivor.path)
+            if row is not None:
+                self.results_table.removeRow(row)
+            self.file_data.pop(hash_value, None)
+
+    def _set_status_item(self, status_item: QTableWidgetItem, file_info: FileInfo):
+        if not status_item:
+            return
+
+        status = getattr(file_info, "status", "Unknown")
+
+        if file_info.error == "Missing":
+            status_item.setText("Missing")
+            status_item.setBackground(QColor(200, 200, 200))
+        elif status == "Missing":
+            status_item.setText("Missing")
+            status_item.setBackground(QColor(255, 230, 150))
+            if file_info.missing_locations:
+                tooltip = "\n".join(file_info.missing_locations)
+                status_item.setToolTip(f"Missing in:\n{tooltip}")
+        elif status == "Duplicate" or file_info.is_duplicate:
+            status_item.setText("Duplicate")
+            status_item.setBackground(QColor(255, 200, 200))
+        elif status == "Unique":
+            status_item.setText("Unique")
+            status_item.setBackground(QColor(255, 255, 255))
+        else:
+            status_item.setText(status)
+            status_item.setBackground(QColor(240, 240, 240))
 
     def _row_for_path(self, path: Path) -> Optional[int]:
         for row in range(self.results_table.rowCount()):
@@ -494,12 +626,14 @@ class SimpleDeduplicatorApp(QMainWindow):
             size_item.setData(Qt.ItemDataRole.UserRole, file_info.size)
 
         if hash_item:
-            hash_item.setText(file_info.hash_value[:16] + "...")
+            if getattr(file_info, "status", "") == "Missing":
+                hash_item.setText("Missing")
+            else:
+                hash_item.setText(file_info.hash_value[:16] + "...")
             hash_item.setToolTip(file_info.hash_value)
 
         if status_item:
-            status_item.setText("Duplicate")
-            status_item.setBackground(QColor(255, 200, 200))
+            self._set_status_item(status_item, file_info)
 
     def update_duplicates_view(self, files: List[FileInfo]):
         if not files:
@@ -512,6 +646,10 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.file_data.pop(hash_value, None)
             return
 
+        for info in existing_files:
+            info.is_duplicate = True
+            info.status = "Duplicate"
+
         self.file_data[hash_value] = existing_files
 
         for file_info in existing_files:
@@ -521,6 +659,29 @@ class SimpleDeduplicatorApp(QMainWindow):
             else:
                 self._refresh_row(row, file_info)
 
+        self.update_selection_info()
+
+    def handle_missing_found(self, file_info: FileInfo):
+        if self.current_mode != "missing":
+            return
+
+        key = file_info.hash_value
+        file_info.status = "Missing"
+
+        existing = self.file_data.get(key, [])
+        for existing_info in existing:
+            if existing_info.path == file_info.path:
+                existing_info.missing_locations = file_info.missing_locations
+                existing_info.status = "Missing"
+                row = self._row_for_path(existing_info.path)
+                if row is not None:
+                    self._refresh_row(row, existing_info)
+                break
+        else:
+            self.file_data[key] = [file_info]
+            self.add_file_to_table(file_info)
+
+        self.missing_found_counter += 1
         self.update_selection_info()
 
     def create_controls_section(self) -> QFrame:
@@ -555,7 +716,13 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.algorithm_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         widest_option = max(len(option) for option in algorithms)
         self.algorithm_combo.setMinimumContentsLength(widest_option + 2)
-        self.algorithm_combo.view().setMinimumWidth(self.algorithm_combo.sizeHint().width() + 24)
+        view = self.algorithm_combo.view()
+        view.setMinimumWidth(self.algorithm_combo.sizeHint().width() + 24)
+        self.algorithm_combo.setMaxVisibleItems(len(algorithms))
+        row_height = view.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = view.fontMetrics().height() + 8
+        view.setMinimumHeight(row_height * len(algorithms) + 8)
         settings_layout.addWidget(self.algorithm_combo)
         
         # Chunk size
@@ -584,10 +751,23 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_scan)
         self.stop_btn.setEnabled(False)
         scan_layout.addWidget(self.stop_btn)
-        
+
         self.clear_btn = QPushButton("Clear Results")
         self.clear_btn.clicked.connect(self.clear_results)
         scan_layout.addWidget(self.clear_btn)
+
+        self.missing_scan_btn = QPushButton("Find Missing")
+        self.missing_scan_btn.setToolTip("Compare folders and list files missing from backups")
+        self.missing_scan_btn.clicked.connect(self.start_missing_scan)
+        scan_layout.addWidget(self.missing_scan_btn)
+
+        self.save_btn = QPushButton("Save Results")
+        self.save_btn.clicked.connect(self.save_results)
+        scan_layout.addWidget(self.save_btn)
+
+        self.load_btn = QPushButton("Open Results")
+        self.load_btn.clicked.connect(self.open_results)
+        scan_layout.addWidget(self.load_btn)
         
         scan_layout.addStretch()
         layout.addLayout(scan_layout)
@@ -617,11 +797,16 @@ class SimpleDeduplicatorApp(QMainWindow):
 
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results_table.setSortingEnabled(True)
+        self.results_table.horizontalHeader().sectionClicked.connect(self.on_sort)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
         self.results_table.verticalHeader().setDefaultSectionSize(30)
-    
+
+    def on_sort(self, logical_index: int):
+        _ = logical_index
+        self.update_selection_info()
+
     def create_bottom_controls(self) -> QWidget:
         """Create bottom control buttons."""
         widget = QWidget()
@@ -656,6 +841,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.hash_worker.scan_completed.connect(self.scan_completed)
         self.hash_worker.error_occurred.connect(self.handle_error)
         self.hash_worker.duplicates_updated.connect(self.update_duplicates_view)
+        self.hash_worker.missing_found.connect(self.handle_missing_found)
         
         # Table selection changes
         self.results_table.itemSelectionChanged.connect(self.update_selection_info)
@@ -717,7 +903,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         algorithm = self.algorithm_combo.currentText().lower()
         chunk_size = self.chunk_size_spin.value() * 1024  # Convert KB to bytes
         
-        self.hash_worker.set_parameters(self.selected_folders, algorithm, chunk_size)
+        self.current_mode = "duplicates"
+        self.hash_worker.set_parameters(self.selected_folders, algorithm, chunk_size, mode="duplicates")
         
         # Set up worker thread
         self.worker_thread = QThread()
@@ -742,7 +929,48 @@ class SimpleDeduplicatorApp(QMainWindow):
         
         # Start the thread
         self.worker_thread.start()
-    
+
+    def start_missing_scan(self):
+        """Compare folders and list files missing from backups."""
+        if not hasattr(self, 'selected_folders') or not self.selected_folders:
+            self.system_messages.add_message("ERROR: No folders selected for scanning")
+            QMessageBox.warning(self, "Warning", "Please select folders to scan first.")
+            return
+
+        if len(self.selected_folders) < 2:
+            self.system_messages.add_message("ERROR: Missing comparison needs at least two folders")
+            QMessageBox.warning(self, "Warning", "Select at least two folders (source + backup).")
+            return
+
+        # Prepare worker
+        chunk_size = self.chunk_size_spin.value() * 1024  # Irrelevant but keeps interface uniform
+
+        self.current_mode = "missing"
+        self.missing_found_counter = 0
+        self.clear_results()
+        self.hash_worker.set_parameters(self.selected_folders, self.algorithm_combo.currentText().lower(), chunk_size, mode="missing")
+
+        # Set up worker thread
+        self.worker_thread = QThread()
+        self.hash_worker.moveToThread(self.worker_thread)
+
+        # Connect thread signals
+        self.worker_thread.started.connect(self.hash_worker.run_scan)
+        self.worker_thread.finished.connect(self.scan_finished)
+
+        # Update UI state
+        self.start_scan_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage("Preparing missing comparison...")
+
+        self.scan_start_time = time.time()
+        self.system_messages.add_message("Missing comparison started (name + size)")
+
+        self.worker_thread.start()
+
     def pause_scan(self):
         """Pause or resume the scanning process."""
         if self.hash_worker.is_paused:
@@ -787,23 +1015,33 @@ class SimpleDeduplicatorApp(QMainWindow):
     def scan_completed(self, hash_groups: Dict[str, List[FileInfo]]):
         """Handle scan completion."""
         self.progress_bar.setValue(100)
-        self.file_data = hash_groups
-        
-        # Populate the results table with duplicates only
-        self.results_table.setRowCount(0)
-        for hash_value, files in hash_groups.items():
-            if len(files) > 1:  # Only show duplicates
-                for file_info in files:
-                    self.add_file_to_table(file_info)
-        
-        # Calculate statistics
-        total_duplicates = sum(len(files) for files in hash_groups.values() if len(files) > 1)
-        duplicate_groups = sum(1 for files in hash_groups.values() if len(files) > 1)
-        
+
         duration = time.time() - self.scan_start_time if self.scan_start_time else 0
-        
-        self.system_messages.add_message(f"Scan completed in {duration:.1f} seconds")
-        self.system_messages.add_message(f"Found {total_duplicates} duplicate files in {duplicate_groups} groups")
+
+        if self.current_mode == "duplicates":
+            self.file_data = hash_groups
+
+            # Populate the results table with duplicates only
+            self.results_table.setRowCount(0)
+            for hash_value, files in hash_groups.items():
+                if len(files) > 1:  # Only show duplicates
+                    for file_info in files:
+                        file_info.status = "Duplicate"
+                        file_info.is_duplicate = True
+                        self.add_file_to_table(file_info)
+
+            total_duplicates = sum(len(files) for files in hash_groups.values() if len(files) > 1)
+            duplicate_groups = sum(1 for files in hash_groups.values() if len(files) > 1)
+
+            self.system_messages.add_message(f"Scan completed in {duration:.1f} seconds")
+            self.system_messages.add_message(f"Found {total_duplicates} duplicate files in {duplicate_groups} groups")
+        else:
+            self.system_messages.add_message(
+                f"Missing comparison completed in {duration:.1f} seconds"
+            )
+            self.system_messages.add_message(
+                f"Missing files detected: {self.missing_found_counter}"
+            )
     
     def scan_finished(self):
         """Handle scan thread completion."""
@@ -820,7 +1058,10 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.progress_bar.setValue(100)
         self.progress_bar.setVisible(False)
         
-        self.statusBar().showMessage("Scan completed")
+        if self.current_mode == "missing":
+            self.statusBar().showMessage("Missing comparison completed")
+        else:
+            self.statusBar().showMessage("Scan completed")
     
     def add_file_to_table(self, file_info: FileInfo):
         """Add a file to the results table."""
@@ -843,20 +1084,22 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.results_table.setItem(row, 2, size_item)
         
         # Hash
-        hash_item = QTableWidgetItem(file_info.hash_value[:16] + "...")  # Truncated for display
-        hash_item.setToolTip(file_info.hash_value)  # Full hash in tooltip
+        if getattr(file_info, "status", "") == "Missing":
+            display_hash = "Missing"
+        else:
+            display_hash = file_info.hash_value[:16] + "..."
+        hash_item = QTableWidgetItem(display_hash)
+        hash_item.setToolTip(file_info.hash_value)
         self.results_table.setItem(row, 3, hash_item)
         
         # Status
-        status_text = "Duplicate" if file_info.is_duplicate else "Unique"
-        status_item = QTableWidgetItem(status_text)
-        if file_info.is_duplicate:
-            status_item.setBackground(QColor(255, 200, 200))  # Light red background
+        status_item = QTableWidgetItem()
+        self._set_status_item(status_item, file_info)
         self.results_table.setItem(row, 4, status_item)
         
         # Delete button
         delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(lambda: self.delete_single_file(row))
+        delete_btn.clicked.connect(lambda checked=False, r=row: self.delete_single_file(r))
         self.results_table.setCellWidget(row, 5, delete_btn)
         
         # Store file info for later use
@@ -903,13 +1146,18 @@ class SimpleDeduplicatorApp(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open Location Failed", f"Could not open file location:\n{exc}")
 
+    def _row_file_info(self, row: int) -> Optional[FileInfo]:
+        if row < 0 or row >= self.results_table.rowCount():
+            return None
+        item = self.results_table.item(row, 0)
+        if not item:
+            return None
+        file_info: Optional[FileInfo] = item.data(Qt.ItemDataRole.UserRole)
+        return file_info
+
     def delete_single_file(self, row: int):
         """Delete a single file."""
-        filename_item = self.results_table.item(row, 0)
-        if not filename_item:
-            return
-            
-        file_info: FileInfo = filename_item.data(Qt.ItemDataRole.UserRole)
+        file_info = self._row_file_info(row)
         if not file_info:
             return
         
@@ -924,6 +1172,7 @@ class SimpleDeduplicatorApp(QMainWindow):
                 self.move_to_trash(file_info.path)
                 self.results_table.removeRow(row)
                 self._remove_file_from_data(file_info)
+                self._cleanup_empty_hash(file_info.hash_value)
                 self.system_messages.add_message(f"Deleted: {file_info.path.name}")
                 self.update_selection_info()
             except Exception as e:
@@ -931,9 +1180,7 @@ class SimpleDeduplicatorApp(QMainWindow):
     
     def delete_selected_files(self):
         """Delete all selected files."""
-        selected_rows = set()
-        for item in self.results_table.selectedItems():
-            selected_rows.add(item.row())
+        selected_rows = {index.row() for index in self.results_table.selectionModel().selectedRows()}
         
         if not selected_rows:
             QMessageBox.information(self, "No Selection", "Please select files to delete.")
@@ -973,6 +1220,7 @@ class SimpleDeduplicatorApp(QMainWindow):
                     self.move_to_trash(file_info.path)
                     self.results_table.removeRow(row)
                     self._remove_file_from_data(file_info)
+                    self._cleanup_empty_hash(file_info.hash_value)
                     deleted_count += 1
                 except Exception as e:
                     logger.error(f"Failed to delete {file_info.path}: {e}")
@@ -1010,7 +1258,152 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.results_table.setRowCount(0)
         self.file_data.clear()
         self.system_messages.add_message("Results cleared")
-    
+        self.missing_found_counter = 0
+
+    def save_results(self):
+        """Persist current results to a JSON file."""
+        if not self.file_data:
+            QMessageBox.information(self, "No Results", "There are no scan results to save yet.")
+            return
+
+        default_name = datetime.now().strftime("simple-deduplicator-%Y%m%d-%H%M%S.json")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Scan Results", default_name, "JSON Files (*.json)"
+        )
+
+        if not path:
+            return
+
+        data = {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(),
+            "algorithm": self.algorithm_combo.currentText(),
+            "folders": [str(folder) for folder in getattr(self, "selected_folders", [])],
+            "entries": [],
+        }
+
+        for hash_value, files in self.file_data.items():
+            entry = {
+                "hash": hash_value,
+                "files": [
+                    {
+                        "path": str(file.path),
+                        "size": file.size,
+                        "duplicate": file.is_duplicate,
+                        "status": getattr(file, "status", "Unknown"),
+                        "missing_locations": file.missing_locations,
+                    }
+                    for file in files
+                ],
+            }
+            data["entries"].append(entry)
+
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save Failed", f"Could not save results:\n{exc}")
+            return
+
+        self.system_messages.add_message(f"Results saved to {path}")
+
+    def open_results(self):
+        """Load scan results from a JSON snapshot."""
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(self, "Scan Running", "Please stop the current scan before loading results.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Scan Results", "", "JSON Files (*.json)"
+        )
+
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, "Load Failed", f"Could not load results:\n{exc}")
+            return
+
+        entries = data.get("entries", [])
+        if not entries:
+            QMessageBox.information(self, "No Data", "The selected file does not contain any results.")
+            return
+
+        self.results_table.setRowCount(0)
+        self.file_data.clear()
+
+        folders = [Path(folder) for folder in data.get("folders", [])]
+        if folders:
+            self.selected_folders = folders
+            display_text = str(folders[0])
+            if len(folders) > 1:
+                display_text = f"{display_text} (+{len(folders) - 1} more)"
+            self.selected_folders_label.setText(f"Loaded: {display_text}")
+            self.selected_folders_label.setToolTip("\n".join(str(folder) for folder in folders))
+
+        loaded_missing = False
+        missing_loaded_count = 0
+
+        for entry in entries:
+            hash_value = entry.get("hash")
+            file_items = entry.get("files", [])
+            if not hash_value or not file_items:
+                continue
+
+            files: List[FileInfo] = []
+            for file_payload in file_items:
+                path_str = file_payload.get("path")
+                if not path_str:
+                    continue
+
+                file_path = Path(path_str)
+                recorded_size = file_payload.get("size")
+                if recorded_size is None:
+                    if file_path.exists():
+                        recorded_size = file_path.stat().st_size
+                    else:
+                        recorded_size = 0
+                duplicate_flag = file_payload.get("duplicate", True)
+                status_value = file_payload.get("status")
+                missing_locations = file_payload.get("missing_locations", [])
+
+                file_info = FileInfo(
+                    path=file_path,
+                    size=recorded_size,
+                    hash_value=hash_value,
+                    is_duplicate=duplicate_flag,
+                    status=status_value or ("Duplicate" if duplicate_flag else "Unique"),
+                )
+
+                if missing_locations:
+                    file_info.missing_locations = missing_locations
+                    loaded_missing = True
+                    missing_loaded_count += 1
+
+                if not file_path.exists():
+                    file_info.error = "Missing"
+
+                files.append(file_info)
+
+            if len(files) < 2:
+                continue
+
+            for info in files:
+                info.is_duplicate = True
+
+            self.file_data[hash_value] = files
+
+            for info in files:
+                self.add_file_to_table(info)
+
+        self.current_mode = "missing" if loaded_missing else "duplicates"
+        self.missing_found_counter = missing_loaded_count if loaded_missing else 0
+        self.update_selection_info()
+        self.system_messages.add_message(f"Loaded results from {path}")
+
     def update_selection_info(self):
         """Update selection information."""
         selected_count = len(self.results_table.selectedItems()) // self.results_table.columnCount()
