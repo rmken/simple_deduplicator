@@ -629,7 +629,8 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.update_throttle = 0.1  # Minimum time between UI updates (seconds)
         self._cleanup_requested = False
         self._cleanup_in_progress = False
-        
+        self.shared_owner = "duplicates"
+
         self.init_ui()
         self.setup_connections()
         self.apply_theme()
@@ -2413,10 +2414,6 @@ def main():
         app.setWindowIcon(app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
     except:
         pass
-    
-    # Enable high DPI support
-    app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     
     try:
         # Create and show main window
