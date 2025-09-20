@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QSplitter, QFileDialog, QMessageBox,
     QComboBox, QLabel, QCheckBox, QSpinBox, QGroupBox, QFrame,
     QAbstractItemView, QStyle, QListView, QTreeView, QSizePolicy,
-    QMenu
+    QMenu, QLayout
 )
 from PySide6.QtCore import (
     QThread, QObject, Signal, QTimer, Qt, QSize, QSettings, QUrl
@@ -346,6 +346,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.init_ui()
         self.setup_connections()
         self.apply_theme()
+        self.setup_cleanup_timer()
         
     def init_ui(self):
         """Initialize the user interface."""
@@ -372,9 +373,11 @@ class SimpleDeduplicatorApp(QMainWindow):
         # Set splitter proportions (80% left, 20% right)
         splitter.setSizes([800, 200])
         
+        self._tune_layout_spacing()
+
         # Status bar
         self.statusBar().showMessage("Ready")
-        
+
     def create_left_panel(self) -> QWidget:
         """Create the left panel with controls and table."""
         panel = QWidget()
@@ -398,7 +401,62 @@ class SimpleDeduplicatorApp(QMainWindow):
         layout.addWidget(bottom_controls)
         
         return panel
-    
+
+    def _tune_layout_spacing(self):
+        """Ensure layouts have comfortable spacing in both themes."""
+        for layout in self.findChildren(QLayout):
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
+
+    def setup_cleanup_timer(self):
+        """Periodically remove rows for files deleted outside the app."""
+        self.cleanup_timer = QTimer(self)
+        self.cleanup_timer.setInterval(10000)  # 10 seconds
+        self.cleanup_timer.timeout.connect(self.prune_missing_files)
+        self.cleanup_timer.start()
+
+    def prune_missing_files(self):
+        """Check for rows referencing files no longer on disk and drop them."""
+        rows_to_remove: List[Tuple[int, FileInfo]] = []
+
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, 0)
+            if not item:
+                continue
+
+            file_info: Optional[FileInfo] = item.data(Qt.ItemDataRole.UserRole)
+            if not file_info:
+                continue
+
+            if not file_info.path.exists():
+                rows_to_remove.append((row, file_info))
+
+        if not rows_to_remove:
+            return
+
+        for row, file_info in reversed(rows_to_remove):
+            self.results_table.removeRow(row)
+            self._remove_file_from_data(file_info)
+
+        self.update_selection_info()
+        removed_names = ", ".join(file_info.path.name for _, file_info in rows_to_remove[:5])
+        summary = removed_names if len(rows_to_remove) <= 5 else f"{len(rows_to_remove)} entries"
+        self.system_messages.add_message(
+            f"Removed missing files from results: {summary}"
+        )
+
+    def _remove_file_from_data(self, file_info: FileInfo):
+        """Update cached duplicate groups after a file disappears."""
+        files = self.file_data.get(file_info.hash_value)
+        if not files:
+            return
+
+        updated = [info for info in files if info.path != file_info.path]
+        if updated:
+            self.file_data[file_info.hash_value] = updated
+        else:
+            self.file_data.pop(file_info.hash_value, None)
+
     def create_controls_section(self) -> QFrame:
         """Create the main controls section."""
         frame = QFrame()
@@ -496,6 +554,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
+        self.results_table.verticalHeader().setDefaultSectionSize(30)
     
     def create_bottom_controls(self) -> QWidget:
         """Create bottom control buttons."""
@@ -791,7 +850,9 @@ class SimpleDeduplicatorApp(QMainWindow):
             try:
                 self.move_to_trash(file_info.path)
                 self.results_table.removeRow(row)
+                self._remove_file_from_data(file_info)
                 self.system_messages.add_message(f"Deleted: {file_info.path.name}")
+                self.update_selection_info()
             except Exception as e:
                 QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
     
@@ -838,6 +899,7 @@ class SimpleDeduplicatorApp(QMainWindow):
                 try:
                     self.move_to_trash(file_info.path)
                     self.results_table.removeRow(row)
+                    self._remove_file_from_data(file_info)
                     deleted_count += 1
                 except Exception as e:
                     logger.error(f"Failed to delete {file_info.path}: {e}")
@@ -846,6 +908,7 @@ class SimpleDeduplicatorApp(QMainWindow):
             self.system_messages.add_message(
                 f"Bulk delete completed: {deleted_count} deleted, {failed_count} failed"
             )
+            self.update_selection_info()
     
     def move_to_trash(self, file_path: Path):
         """Move file to trash/recycle bin."""
