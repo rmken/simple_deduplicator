@@ -5,6 +5,18 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, coll
 proj_root = os.getcwd()
 script = os.path.join(proj_root, "simple-deduplicator.py")
 
+extra_qt_libs = [
+    "/usr/lib/x86_64-linux-gnu/libxcb-cursor.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxkbcommon-x11.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxcb-icccm.so.4",
+    "/usr/lib/x86_64-linux-gnu/libxcb-image.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxcb-keysyms.so.1",
+    "/usr/lib/x86_64-linux-gnu/libxcb-render-util.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxcb-shape.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxcb-xinerama.so.0",
+    "/usr/lib/x86_64-linux-gnu/libxcb-xinput.so.0",
+]
+
 datas = []
 hiddenimports = []
 binaries = []
@@ -34,6 +46,10 @@ binaries      += collect_dynamic_libs("blake3")
 
 hiddenimports += ["xxhash"]
 binaries      += collect_dynamic_libs("xxhash")
+
+for lib in extra_qt_libs:
+    if os.path.exists(lib):
+        binaries.append((lib, "lib"))
 
 a = Analysis(
     [script],

@@ -10,6 +10,7 @@ import hashlib
 import logging
 import threading
 import time
+import locale
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple, Any
@@ -20,6 +21,22 @@ import json
 import sqlite3
 import tempfile
 import shutil
+
+def _ensure_utf8_locale():
+    """Force a UTF-8 locale so Qt has the expected environment."""
+    target = "C.UTF-8"
+    current = os.environ.get("LC_ALL")
+
+    if current in (None, "", "C"):
+        try:
+            locale.setlocale(locale.LC_ALL, target)
+            os.environ["LC_ALL"] = target
+            os.environ.setdefault("LANG", target)
+        except locale.Error:
+            pass  # Leave locale untouched if target doesn't exist
+
+
+_ensure_utf8_locale()
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
