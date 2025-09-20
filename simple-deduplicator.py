@@ -1225,6 +1225,16 @@ class SimpleDeduplicatorApp(QMainWindow):
             if obj is getattr(self, 'missing_dest_list', None):
                 self.remove_selected_missing_destinations()
                 return True
+            if obj is getattr(self, 'results_table', None) and self.current_mode == "duplicates":
+                selected_rows = sorted(
+                    {index.row() for index in self.results_table.selectionModel().selectedRows()},
+                    reverse=True,
+                )
+                for row in selected_rows:
+                    file_info = self._get_file_info_from_row(row)
+                    if file_info:
+                        self._remove_duplicate_entry(row, file_info)
+                return True
         return super().eventFilter(obj, event)
 
     def _format_folder_list(self, folders: List[Path]) -> str:
@@ -1250,6 +1260,7 @@ class SimpleDeduplicatorApp(QMainWindow):
         self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
         self.results_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.results_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.results_table.installEventFilter(self)
         
         # Set default column widths
         header = self.results_table.horizontalHeader()
@@ -1833,44 +1844,28 @@ Status: {file_info.status}"""
         if not file_info:
             return
 
-        if self.current_mode == "duplicates":
-            self._remove_duplicate_entry(row, file_info)
-            return
-
         # Confirm deletion
-        if file_info.path.exists():
-            message = f"Move to trash:\n{file_info.path}\n\nSize: {self.format_size(file_info.size)}"
-            reply = QMessageBox.question(
-                self, "Confirm Delete",
-                message,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        else:
-            reply = QMessageBox.question(
-                self, "File Missing",
-                f"This file no longer exists on disk:\n{file_info.path}\n\nRemove it from the list?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Move to trash:\n{file_info.path}\n\nSize: {self.format_size(file_info.size)}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
 
-        try:
-            if file_info.path.exists():
-                self.move_to_trash(file_info.path)
-                self.system_messages.add_message(f"Moved to trash: {file_info.path}")
-            else:
-                self.system_messages.add_warning(f"File already missing: {file_info.path}")
-            self.results_table.removeRow(row)
-            self._remove_file_from_data(file_info)
-            self._cleanup_empty_hash(file_info.hash_value)
-            self.update_selection_info()
-        except Exception as e:
-            self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
-            QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                if file_info.path.exists():
+                    self.move_to_trash(file_info.path)
+                    self.system_messages.add_message(f"Moved to trash: {file_info.path.name}")
+                else:
+                    self.system_messages.add_warning(f"File already missing: {file_info.path}")
+                self.results_table.removeRow(row)
+                self._remove_file_from_data(file_info)
+                self._cleanup_empty_hash(file_info.hash_value)
+                self.update_selection_info()
+            except Exception as e:
+                self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
+                QMessageBox.critical(self, "Delete Error", f"Could not delete file:\n{e}")
 
     def _remove_duplicate_entry(self, row: int, file_info: FileInfo):
         """Remove a duplicate entry from the results without touching the file system."""
