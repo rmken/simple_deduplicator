@@ -1930,9 +1930,11 @@ Status: {file_info.status}"""
         # Sort by row in descending order to avoid index issues
         files_to_delete.sort(key=lambda x: x[0], reverse=True)
         
+        trash_fallback_state = {"permanent_delete": None} if len(files_to_delete) > 1 else None
+
         for i, (row, file_info) in enumerate(files_to_delete):
             try:
-                self.move_to_trash(file_info.path)
+                self.move_to_trash(file_info.path, trash_fallback_state)
                 self.results_table.removeRow(row)
                 self._remove_file_from_data(file_info)
                 self._cleanup_empty_hash(file_info.hash_value)
@@ -1941,6 +1943,8 @@ Status: {file_info.status}"""
             except Exception as e:
                 self.system_messages.add_error(f"Failed to delete {file_info.path.name}: {e}")
                 failed_count += 1
+                if trash_fallback_state and trash_fallback_state.get("permanent_delete") is False:
+                    break
             
             self.progress_bar.setValue(i + 1)
             QApplication.processEvents()  # Keep UI responsive
@@ -1959,8 +1963,8 @@ Status: {file_info.status}"""
         
         self.update_selection_info()
 
-    def move_to_trash(self, file_path: Path):
-        """Move file to trash with improved cross-platform support."""
+    def move_to_trash(self, file_path: Path, trash_fallback_state: Optional[Dict[str, Optional[bool]]] = None):
+        """Move file to trash, respecting shared fallback decisions when trash is unavailable."""
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
             
@@ -1993,15 +1997,32 @@ Status: {file_info.status}"""
                         subprocess.run(["trash", str(file_path)], check=True)
                     except (subprocess.CalledProcessError, FileNotFoundError):
                         # Last resort - direct deletion with confirmation
+                        if trash_fallback_state:
+                            decision = trash_fallback_state.get("permanent_delete")
+                            if decision is True:
+                                file_path.unlink()
+                                return
+                            if decision is False:
+                                raise RuntimeError("User cancelled permanent deletion")
+
+                        buttons = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        if trash_fallback_state:
+                            buttons |= QMessageBox.StandardButton.YesToAll | QMessageBox.StandardButton.NoToAll
+
                         reply = QMessageBox.question(
-                            self, "Trash Not Available",
+                            self,
+                            "Trash Not Available",
                             f"System trash is not available. Permanently delete file?\n{file_path}",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            buttons,
                             QMessageBox.StandardButton.No
                         )
-                        if reply == QMessageBox.StandardButton.Yes:
+                        if reply in (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.YesToAll):
+                            if trash_fallback_state and reply == QMessageBox.StandardButton.YesToAll:
+                                trash_fallback_state["permanent_delete"] = True
                             file_path.unlink()
                         else:
+                            if trash_fallback_state and reply == QMessageBox.StandardButton.NoToAll:
+                                trash_fallback_state["permanent_delete"] = False
                             raise RuntimeError("User cancelled permanent deletion")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to move to trash: {e}")
